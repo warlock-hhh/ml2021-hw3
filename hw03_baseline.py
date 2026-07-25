@@ -1,0 +1,466 @@
+from __future__ import annotations
+
+"""
+ML2021 HW3：Food-11 CNN baseline
+
+程式流程：
+1. 從 food-11 資料夾建立 training / validation / testing DataLoader。
+2. 使用 CNN 將 128×128 RGB 圖片分類成 11 類。
+3. 每個 epoch 分別執行訓練與驗證。
+4. 保存 validation accuracy 最高的模型參數。
+5. 載入最佳模型，對 testing data 產生 predict.csv。
+"""
+
+import argparse
+import csv
+from pathlib import Path
+
+# torch：Tensor、CUDA、模型儲存等核心功能。
+import torch
+# torch.nn：建立神經網路 layer、loss function。
+import torch.nn as nn
+# Pillow：讀取 JPG 圖片。
+from PIL import Image
+# DataLoader：把 Dataset 分批、打亂並交給模型。
+from torch.utils.data import DataLoader
+# transforms：圖片 Resize、轉 Tensor 與後續的 data augmentation。
+from torchvision import transforms
+# DatasetFolder：根據子資料夾名稱自動建立 class label。
+from torchvision.datasets import DatasetFolder
+
+# tqdm 只負責顯示進度條；即使沒有安裝，訓練仍可執行。
+try:
+    from tqdm.auto import tqdm
+except ModuleNotFoundError:
+    def tqdm(iterable, **_kwargs):
+        return iterable
+
+
+# __file__ 是目前程式檔；parent 取得 ml_hw3 資料夾。
+ROOT = Path(__file__).resolve().parent
+# 資料集預期放在「程式所在資料夾 / food-11」。
+DATA_ROOT = ROOT / "food-11"
+
+
+def load_rgb_image(path: str) -> Image.Image:
+    """開啟 JPG，並統一轉成模型需要的三通道 RGB 圖片。"""
+    # with 區塊結束時會自動關閉原始圖片檔案。
+    with Image.open(path) as image:
+        # convert("RGB") 會建立新圖片，因此原始檔關閉後仍能使用。
+        return image.convert("RGB")
+
+
+class Classifier(nn.Module):
+    """輸入 [batch, 3, 128, 128]，輸出 [batch, 11] logits。"""
+
+    def __init__(self, dropout_rate: float = 0.0) -> None:
+        # 初始化 nn.Module，讓 PyTorch 能追蹤所有可訓練參數。
+        super().__init__()
+
+        # CNN 負責從圖片抽取空間特徵。
+        self.cnn_layers = nn.Sequential(
+            # [B, 3, 128, 128] -> [B, 64, 128, 128]
+            # padding=1 讓 3×3 convolution 前後的長寬維持不變。
+            nn.Conv2d(3, 64, 3, padding=1),
+            # 穩定每個 channel 的數值分布。
+            nn.BatchNorm2d(64),
+            # 加入非線性：負數歸零，正數保留。
+            nn.ReLU(),
+            # 2×2 pooling：長寬各縮小一半。
+            # [B, 64, 128, 128] -> [B, 64, 64, 64]
+            nn.MaxPool2d(2),
+
+            # [B, 64, 64, 64] -> [B, 128, 64, 64]
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            # [B, 128, 64, 64] -> [B, 128, 32, 32]
+            nn.MaxPool2d(2),
+
+            # [B, 128, 32, 32] -> [B, 256, 32, 32]
+            nn.Conv2d(128, 256, 3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            # 4×4 pooling：長寬各除以 4。
+            # [B, 256, 32, 32] -> [B, 256, 8, 8]
+            nn.MaxPool2d(4),
+        )
+
+        # Fully connected layers 根據 CNN 特徵決定最終類別。
+        self.fc_layers = nn.Sequential(
+            # 256×8×8 = 16,384 個特徵，壓縮成 256 維。
+            nn.Linear(256 * 8 * 8, 256),
+            nn.ReLU(),
+            # 訓練時隨機將部分特徵歸零；驗證與推論時自動關閉。
+            nn.Dropout(dropout_rate),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            # Food-11 有 11 類，因此輸出 11 個 logits。
+            # 不加 Softmax，因為 CrossEntropyLoss 會在內部處理。
+            nn.Linear(256, 11),
+        )
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """定義資料通過模型的順序（forward pass）。"""
+        # images：[B, 3, 128, 128]
+        # features：[B, 256, 8, 8]
+        features = self.cnn_layers(images)
+        # flatten(1) 保留 batch 維度，把其餘維度攤平成 [B, 16384]。
+        # FC layers 最後回傳 [B, 11]。
+        return self.fc_layers(features.flatten(1))
+
+
+def build_loaders(
+    batch_size: int,
+    num_workers: int,
+    augment: bool = False,
+) -> tuple[
+    DataLoader, DataLoader, DataLoader
+]:
+    """建立 training、validation、testing 三個 DataLoader。"""
+
+    if augment:
+        # 保守的 on-the-fly augmentation：
+        # 每次 DataLoader 讀圖時重新抽取隨機參數，但不修改硬碟原圖。
+        train_transform = transforms.Compose(
+            [
+                # 保留原圖 85%～100% 面積，並限制長寬比避免嚴重變形。
+                transforms.RandomResizedCrop(
+                    128,
+                    scale=(0.85, 1.0),
+                    ratio=(0.9, 1.1),
+                ),
+                # 食物左右朝向不影響類別，因此可用 50% 機率翻轉。
+                transforms.RandomHorizontalFlip(p=0.5),
+                # 僅小幅旋轉；空白角落以中性灰填補，避免黑角特徵。
+                transforms.RandomRotation(10, fill=(128, 128, 128)),
+                # 模擬不同拍攝光線，幅度保持保守以免破壞食物顏色。
+                transforms.ColorJitter(
+                    brightness=0.15,
+                    contrast=0.15,
+                    saturation=0.1,
+                    hue=0.02,
+                ),
+                # PIL Image -> [C, H, W]、數值 0.0～1.0 的 Tensor。
+                transforms.ToTensor(),
+            ]
+        )
+    else:
+        # 無 augmentation 的原始 baseline。
+        train_transform = transforms.Compose(
+            [
+                # 所有圖片統一成 128×128，才能組成相同形狀的 batch。
+                transforms.Resize((128, 128)),
+                # PIL Image -> torch.Tensor。
+                # 數值由 0～255 轉成 0.0～1.0，形狀變成 [C, H, W]。
+                transforms.ToTensor(),
+            ]
+        )
+
+    # validation / testing 不可使用隨機 augmentation，
+    # 否則同一張圖片每次評估的內容不同，結果就不穩定。
+    eval_transform = transforms.Compose(
+        [
+            transforms.Resize((128, 128)),
+            transforms.ToTensor(),
+        ]
+    )
+
+    # DatasetFolder 依照 00～10 子資料夾，自動建立 label 0～10。
+    train_set = DatasetFolder(
+        DATA_ROOT / "training" / "labeled",
+        loader=load_rgb_image,
+        # 只讀取副檔名為 .jpg 的檔案。
+        extensions=("jpg",),
+        transform=train_transform,
+    )
+
+    # validation 有正確標籤，只用來評估泛化能力，不更新模型。
+    valid_set = DatasetFolder(
+        DATA_ROOT / "validation",
+        loader=load_rgb_image,
+        extensions=("jpg",),
+        transform=eval_transform,
+    )
+    # testing 的 00 資料夾只是 DatasetFolder 所需的目錄形式，
+    # 其中的 label 是假的；推論時只使用圖片，不使用該 label。
+    test_set = DatasetFolder(
+        DATA_ROOT / "testing",
+        loader=load_rgb_image,
+        extensions=("jpg",),
+        transform=eval_transform,
+    )
+
+    # 使用 CUDA 時鎖定 CPU memory，可加快 CPU -> GPU 的資料傳輸。
+    pin_memory = torch.cuda.is_available()
+
+    # training 必須 shuffle，避免模型一直以固定類別順序看到資料。
+    train_loader = DataLoader(
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    # validation 不可 shuffle；雖然 accuracy 不受順序影響，
+    # 固定順序較容易重現與除錯。
+    valid_loader = DataLoader(
+        valid_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    # testing 絕對不可 shuffle，因為 CSV 的 Id 必須對應固定圖片順序。
+    test_loader = DataLoader(
+        test_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    # 一次回傳三個 loader，讓 main() 接收。
+    return train_loader, valid_loader, test_loader
+
+
+def run_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer | None = None,
+) -> tuple[float, float]:
+    """
+    完整走過一份 DataLoader。
+
+    有傳 optimizer：training mode，會 backward 並更新參數。
+    沒傳 optimizer：validation mode，只計算 loss 與 accuracy。
+    回傳整個 epoch 的平均 loss 與 accuracy。
+    """
+
+    # optimizer 只有訓練時存在，因此可用它判斷目前模式。
+    training = optimizer is not None
+    # True 等同 model.train()；False 等同 model.eval()。
+    # 這會影響 BatchNorm（以及未來可能加入的 Dropout）。
+    model.train(training)
+
+    # 累計整個 epoch 的 loss、答對數量與樣本總數。
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+
+    description = "Train" if training else "Valid"
+    # DataLoader 每次回傳一個 batch：(images, labels)。
+    for images, labels in tqdm(loader, desc=description):
+        # 把圖片和標籤移到同一個運算裝置（CUDA 或 CPU）。
+        # non_blocking 搭配 pin_memory，可讓 CUDA 傳輸更有效率。
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        if training:
+            # 清除上一個 batch 留下的 gradient。
+            # PyTorch 預設會累加 gradient，所以每批更新前必須歸零。
+            optimizer.zero_grad()
+
+        # training=True：PyTorch 建立計算圖，以便 backward。
+        # training=False：不追蹤 gradient，節省驗證所需記憶體與時間。
+        with torch.set_grad_enabled(training):
+            # Forward pass：[B, 3, 128, 128] -> [B, 11] logits。
+            logits = model(images)
+            # 比較 logits 與正確 labels，得到此 batch 的平均 loss。
+            loss = criterion(logits, labels)
+
+            if training:
+                # Backpropagation：計算 loss 對每個參數的 gradient。
+                loss.backward()
+                # 限制整體 gradient norm，降低 gradient explosion 風險。
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=10)
+                # Adam 根據 gradient 更新 Conv、Linear、BatchNorm 參數。
+                optimizer.step()
+
+        # 最後一批可能不足 batch_size，因此以實際 label 數量為準。
+        batch_count = labels.size(0)
+        # loss.item() 是 batch 平均 loss；乘樣本數後才能正確做全體平均。
+        total_loss += loss.item() * batch_count
+        # argmax 找出 11 個 logits 中最大者，作為預測類別。
+        total_correct += (logits.argmax(dim=1) == labels).sum().item()
+        total_samples += batch_count
+
+    # 平均 loss = loss 總和 / 圖片數。
+    # accuracy = 答對圖片數 / 圖片總數。
+    return total_loss / total_samples, total_correct / total_samples
+
+
+def write_predictions(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    output_path: Path,
+) -> None:
+    """使用訓練好的模型預測 testing data，並寫成 Kaggle CSV。"""
+
+    # 切換 evaluation mode，讓 BatchNorm 使用訓練期統計值。
+    model.eval()
+    # 依 testing 圖片順序保存每張圖的預測類別。
+    predictions: list[int] = []
+
+    # 推論不需要 backward，因此完全關閉 gradient。
+    with torch.no_grad():
+        # testing 的 label 是假的，所以用底線表示刻意忽略。
+        for images, _ in tqdm(loader, desc="Test"):
+            logits = model(images.to(device, non_blocking=True))
+            # GPU Tensor -> CPU -> Python list，再加入 predictions。
+            predictions.extend(logits.argmax(dim=1).cpu().tolist())
+
+    # newline="" 避免 Windows CSV 出現多餘空白行。
+    with output_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        # Kaggle 規定的欄位名稱。
+        writer.writerow(["Id", "Category"])
+        # enumerate 產生 (0, pred0)、(1, pred1)...。
+        writer.writerows(enumerate(predictions))
+
+
+def parse_args() -> argparse.Namespace:
+    """讀取使用者從終端機傳入的執行參數。"""
+
+    parser = argparse.ArgumentParser(description="ML2021 HW3 CNN baseline")
+    # 完整看過 training set 幾次；預設 1 次用於 smoke test。
+    parser.add_argument("--epochs", type=int, default=1)
+    # 每次同時送進模型的圖片數；RTX 3050 4 GB 先使用 32。
+    parser.add_argument("--batch-size", type=int, default=32)
+    # Windows baseline 使用 0，代表由主程序讀圖，最穩定。
+    parser.add_argument("--num-workers", type=int, default=0)
+    # 開啟保守的 on-the-fly training data augmentation。
+    parser.add_argument(
+        "--augment",
+        action="store_true",
+        help="訓練時使用隨機裁切、翻轉、旋轉與輕微調色",
+    )
+    # Fully connected layers 的 Dropout 比例；0 表示完全關閉。
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.0,
+        help="FC hidden layers 的 Dropout 比例，例如 0.3",
+    )
+    # 指定此參數時不訓練，只載入 best_model.pt 重新產生 CSV。
+    parser.add_argument(
+        "--predict-only",
+        action="store_true",
+        help="載入現有 best_model.pt 產生 predict.csv，不重新訓練",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    """組合資料、模型、訓練、驗證、checkpoint 與推論流程。"""
+
+    args = parse_args()
+
+    # 提早確認資料集存在，避免訓練開始後才出現難懂的路徑錯誤。
+    if not DATA_ROOT.is_dir():
+        raise FileNotFoundError(f"找不到資料集：{DATA_ROOT}")
+    if not 0.0 <= args.dropout < 1.0:
+        raise ValueError("--dropout 必須介於 0.0（含）與 1.0（不含）之間")
+
+    # 若 CUDA 可用就使用 GPU，否則退回 CPU。
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+    if device.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    # 依命令列的 batch size / workers 建立三個 DataLoader。
+    train_loader, valid_loader, test_loader = build_loaders(
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        augment=args.augment,
+    )
+    print(f"Augmentation: {'on' if args.augment else 'off'}")
+    print(f"Dropout: {args.dropout}")
+    print(
+        f"Images: train={len(train_loader.dataset)}, "
+        f"valid={len(valid_loader.dataset)}, test={len(test_loader.dataset)}"
+    )
+
+    # 建立模型並將全部參數搬到 CUDA 或 CPU。
+    model = Classifier(dropout_rate=args.dropout).to(device)
+    # 多類別單選分類使用 CrossEntropyLoss。
+    criterion = nn.CrossEntropyLoss()
+    # Adam 負責根據 gradient 更新所有可訓練參數。
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        # learning rate：每次更新參數的步伐大小。
+        lr=3e-4,
+        # L2 regularization，稍微抑制權重變得過大。
+        weight_decay=1e-5,
+    )
+
+    # 只保存 state_dict（模型學到的參數），不保存 Python 類別本身。
+    # 根據實驗設定使用不同檔名，方便公平比較且避免互相覆寫。
+    experiment_parts: list[str] = []
+    if args.augment:
+        experiment_parts.append("aug")
+    if args.dropout > 0:
+        # 0.3 -> dropout03，避免檔名包含小數點。
+        dropout_tag = str(args.dropout).replace(".", "")
+        experiment_parts.append(f"dropout{dropout_tag}")
+    experiment_tag = "_".join(experiment_parts)
+    suffix = f"_{experiment_tag}" if experiment_tag else ""
+    checkpoint_path = ROOT / f"best_model{suffix}.pt"
+    prediction_path = ROOT / f"predict{suffix}.csv"
+
+    # predict-only：跳過訓練，直接從既有最佳模型產生提交檔。
+    if args.predict_only:
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"找不到模型：{checkpoint_path}")
+        # map_location 確保模型能載入目前 device。
+        # weights_only=True 表示只讀取張量權重，較安全。
+        model.load_state_dict(
+            torch.load(checkpoint_path, map_location=device, weights_only=True)
+        )
+        write_predictions(model, test_loader, device, prediction_path)
+        print(f"Saved: {prediction_path.name}")
+        return
+
+    # accuracy 不可能低於 0，因此 -1 可保證第一輪一定會保存。
+    best_accuracy = -1.0
+
+    # range 的結尾不包含，因此要寫 epochs + 1。
+    for epoch in range(1, args.epochs + 1):
+        # 傳入 optimizer -> training mode，會更新模型。
+        train_loss, train_accuracy = run_epoch(
+            model, train_loader, criterion, device, optimizer
+        )
+        # 不傳 optimizer -> validation mode，不更新模型。
+        valid_loss, valid_accuracy = run_epoch(
+            model, valid_loader, criterion, device
+        )
+        print(
+            f"Epoch {epoch:03d}/{args.epochs:03d} | "
+            f"train loss={train_loss:.4f}, acc={train_accuracy:.4f} | "
+            f"valid loss={valid_loss:.4f}, acc={valid_accuracy:.4f}"
+        )
+
+        # 只在 validation accuracy 創新高時覆寫 checkpoint。
+        # 即使後期 overfitting，也能保留泛化表現最好的一輪。
+        if valid_accuracy > best_accuracy:
+            best_accuracy = valid_accuracy
+            # state_dict 包含 Conv、Linear、BatchNorm 的參數與統計值。
+            torch.save(model.state_dict(), checkpoint_path)
+            print(f"Saved: {checkpoint_path.name}")
+
+    # 訓練結束後，最後一輪不一定最好，因此重新載入最佳 checkpoint。
+    model.load_state_dict(
+        torch.load(checkpoint_path, map_location=device, weights_only=True)
+    )
+    # 使用最佳模型預測 testing data，自動產生 Kaggle 提交檔。
+    write_predictions(model, test_loader, device, prediction_path)
+    print(f"Saved: {prediction_path.name}")
+
+
+if __name__ == "__main__":
+    # 只有直接執行此檔案時才呼叫 main()；
+    # 若其他程式 import 本檔，則只載入函式與類別，不自動開始訓練。
+    main()

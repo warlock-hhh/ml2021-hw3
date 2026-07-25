@@ -1,0 +1,31 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environments
+.venv*/
+venv/
+
+# Food-11 dataset and downloaded archives
+food-11/
+*.zip
+
+# Trained model checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Kaggle predictions and generated previews
+predict*.csv
+augmentation_preview.jpg
+
+# Training logs and experiment outputs
+outputs/
+runs/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
