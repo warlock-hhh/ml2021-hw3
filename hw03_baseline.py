@@ -19,8 +19,8 @@ from pathlib import Path
 import torch
 # torch.nn：建立神經網路 layer、loss function。
 import torch.nn as nn
-# Pillow：讀取 JPG 圖片。
-from PIL import Image
+# Pillow：讀取 JPG 圖片，也用來輸出訓練曲線（不需額外安裝 matplotlib）。
+from PIL import Image, ImageDraw
 # DataLoader：把 Dataset 分批、打亂並交給模型。
 from torch.utils.data import DataLoader
 # transforms：圖片 Resize、轉 Tensor 與後續的 data augmentation。
@@ -292,6 +292,137 @@ def run_epoch(
     return total_loss / total_samples, total_correct / total_samples
 
 
+def save_training_curves(
+    train_losses: list[float],
+    valid_losses: list[float],
+    train_accuracies: list[float],
+    valid_accuracies: list[float],
+    best_epoch: int,
+    output_path: Path,
+) -> None:
+    """將訓練歷史畫成同一張圖；固定路徑會自動覆蓋上一張圖。"""
+
+    # 使用 Pillow 畫圖，避免為了曲線額外安裝 matplotlib。
+    width, height = 1400, 600
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image)
+    draw.text(
+        (20, 15),
+        f"Training curves - best epoch: {best_epoch}",
+        fill="black",
+    )
+
+    def draw_panel(
+        box: tuple[int, int, int, int],
+        title: str,
+        train_values: list[float],
+        valid_values: list[float],
+        y_max: float,
+    ) -> None:
+        """在指定範圍內畫 train/valid 兩條折線。"""
+
+        left, top, right, bottom = box
+        plot_left, plot_top = left + 70, top + 45
+        plot_right, plot_bottom = right - 25, bottom - 55
+        draw.text((left + 10, top + 10), title, fill="black")
+
+        # 畫五等分網格與 Y 軸數值。
+        for index in range(6):
+            y = plot_bottom - (plot_bottom - plot_top) * index / 5
+            value = y_max * index / 5
+            draw.line(
+                (plot_left, y, plot_right, y),
+                fill=(220, 220, 220),
+                width=1,
+            )
+            draw.text((left + 10, y - 7), f"{value:.2f}", fill="black")
+
+        draw.line(
+            (plot_left, plot_top, plot_left, plot_bottom),
+            fill="black",
+            width=2,
+        )
+        draw.line(
+            (plot_left, plot_bottom, plot_right, plot_bottom),
+            fill="black",
+            width=2,
+        )
+
+        epoch_count = len(train_values)
+
+        def to_points(values: list[float]) -> list[tuple[float, float]]:
+            denominator = max(epoch_count - 1, 1)
+            return [
+                (
+                    plot_left
+                    + (plot_right - plot_left) * index / denominator,
+                    plot_bottom
+                    - (plot_bottom - plot_top) * value / max(y_max, 1e-12),
+                )
+                for index, value in enumerate(values)
+            ]
+
+        train_points = to_points(train_values)
+        valid_points = to_points(valid_values)
+        if len(train_points) == 1:
+            # 只有一個 epoch 時還沒有線段，因此畫圓點。
+            x, y = train_points[0]
+            draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=(31, 119, 180))
+            x, y = valid_points[0]
+            draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=(255, 127, 14))
+        else:
+            draw.line(train_points, fill=(31, 119, 180), width=3)
+            draw.line(valid_points, fill=(255, 127, 14), width=3)
+
+        # 以紅色直線標出 validation accuracy 最佳的 epoch。
+        best_x = plot_left + (
+            (plot_right - plot_left)
+            * (best_epoch - 1)
+            / max(epoch_count - 1, 1)
+        )
+        draw.line(
+            (best_x, plot_top, best_x, plot_bottom),
+            fill=(214, 39, 40),
+            width=2,
+        )
+
+        # X 軸顯示第一輪、最佳輪與目前最後一輪。
+        for epoch_number in sorted({1, best_epoch, epoch_count}):
+            x = plot_left + (
+                (plot_right - plot_left)
+                * (epoch_number - 1)
+                / max(epoch_count - 1, 1)
+            )
+            draw.text((x - 8, plot_bottom + 10), str(epoch_number), fill="black")
+
+        legend_y = bottom - 25
+        draw.line((plot_left, legend_y, plot_left + 28, legend_y), fill=(31, 119, 180), width=3)
+        draw.text((plot_left + 35, legend_y - 7), "Train", fill="black")
+        draw.line((plot_left + 100, legend_y, plot_left + 128, legend_y), fill=(255, 127, 14), width=3)
+        draw.text((plot_left + 135, legend_y - 7), "Valid", fill="black")
+        draw.line((plot_left + 200, legend_y, plot_left + 228, legend_y), fill=(214, 39, 40), width=2)
+        draw.text((plot_left + 235, legend_y - 7), "Best epoch", fill="black")
+
+    loss_max = max(max(train_losses), max(valid_losses)) * 1.1
+    draw_panel(
+        (10, 50, 695, 590),
+        "Cross-entropy loss (lower is better)",
+        train_losses,
+        valid_losses,
+        loss_max,
+    )
+    draw_panel(
+        (705, 50, 1390, 590),
+        "Accuracy (higher is better)",
+        train_accuracies,
+        valid_accuracies,
+        1.0,
+    )
+
+    # output_path 固定為 training_curves.png，所以每次都覆蓋而不累積圖片。
+    image.save(output_path)
+
+
 def write_predictions(
     model: nn.Module,
     loader: DataLoader,
@@ -345,6 +476,12 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="FC hidden layers 的 Dropout 比例，例如 0.3",
     )
+    # 根據 validation loss 自動降低 learning rate。
+    parser.add_argument(
+        "--scheduler",
+        action="store_true",
+        help="validation loss 停滯時自動降低 learning rate",
+    )
     # 指定此參數時不訓練，只載入 best_model.pt 重新產生 CSV。
     parser.add_argument(
         "--predict-only",
@@ -396,6 +533,21 @@ def main() -> None:
         # L2 regularization，稍微抑制權重變得過大。
         weight_decay=1e-5,
     )
+    # ReduceLROnPlateau 觀察 validation loss：
+    # 連續 3 個 epoch 沒有改善後，將 learning rate 乘以 0.5。
+    # scheduler 關閉時設為 None，保留原本固定 learning rate 的行為。
+    scheduler = (
+        torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=0.5,
+            patience=3,
+            min_lr=1e-6,
+        )
+        if args.scheduler
+        else None
+    )
+    print(f"LR scheduler: {'on' if args.scheduler else 'off'}")
 
     # 只保存 state_dict（模型學到的參數），不保存 Python 類別本身。
     # 根據實驗設定使用不同檔名，方便公平比較且避免互相覆寫。
@@ -406,10 +558,14 @@ def main() -> None:
         # 0.3 -> dropout03，避免檔名包含小數點。
         dropout_tag = str(args.dropout).replace(".", "")
         experiment_parts.append(f"dropout{dropout_tag}")
+    if args.scheduler:
+        experiment_parts.append("scheduler")
     experiment_tag = "_".join(experiment_parts)
     suffix = f"_{experiment_tag}" if experiment_tag else ""
     checkpoint_path = ROOT / f"best_model{suffix}.pt"
     prediction_path = ROOT / f"predict{suffix}.csv"
+    # 不依實驗名稱改檔名：每次執行都覆蓋舊圖，避免累積大量圖片。
+    curves_path = ROOT / "training_curves.png"
 
     # predict-only：跳過訓練，直接從既有最佳模型產生提交檔。
     if args.predict_only:
@@ -426,9 +582,18 @@ def main() -> None:
 
     # accuracy 不可能低於 0，因此 -1 可保證第一輪一定會保存。
     best_accuracy = -1.0
+    best_epoch = 0
+
+    # 保存每個 epoch 的四項指標，提供畫圖使用。
+    train_losses: list[float] = []
+    valid_losses: list[float] = []
+    train_accuracies: list[float] = []
+    valid_accuracies: list[float] = []
 
     # range 的結尾不包含，因此要寫 epochs + 1。
     for epoch in range(1, args.epochs + 1):
+        # 記下這個 epoch 實際使用的 learning rate。
+        current_lr = optimizer.param_groups[0]["lr"]
         # 傳入 optimizer -> training mode，會更新模型。
         train_loss, train_accuracy = run_epoch(
             model, train_loader, criterion, device, optimizer
@@ -440,16 +605,46 @@ def main() -> None:
         print(
             f"Epoch {epoch:03d}/{args.epochs:03d} | "
             f"train loss={train_loss:.4f}, acc={train_accuracy:.4f} | "
-            f"valid loss={valid_loss:.4f}, acc={valid_accuracy:.4f}"
+            f"valid loss={valid_loss:.4f}, acc={valid_accuracy:.4f} | "
+            f"lr={current_lr:.2e}"
         )
+
+        train_losses.append(train_loss)
+        valid_losses.append(valid_loss)
+        train_accuracies.append(train_accuracy)
+        valid_accuracies.append(valid_accuracy)
 
         # 只在 validation accuracy 創新高時覆寫 checkpoint。
         # 即使後期 overfitting，也能保留泛化表現最好的一輪。
         if valid_accuracy > best_accuracy:
             best_accuracy = valid_accuracy
+            best_epoch = epoch
             # state_dict 包含 Conv、Linear、BatchNorm 的參數與統計值。
             torch.save(model.state_dict(), checkpoint_path)
             print(f"Saved: {checkpoint_path.name}")
+
+        # 每個 epoch 都更新同一張 PNG；即使訓練被中止，仍保留已完成曲線。
+        save_training_curves(
+            train_losses,
+            valid_losses,
+            train_accuracies,
+            valid_accuracies,
+            best_epoch,
+            curves_path,
+        )
+
+        if scheduler is not None:
+            # 必須在 validation 完成後傳入 valid_loss；
+            # 若 loss 長時間沒有下降，下一個 epoch 就會使用較小的 LR。
+            scheduler.step(valid_loss)
+            next_lr = optimizer.param_groups[0]["lr"]
+            if next_lr < current_lr:
+                print(
+                    f"Learning rate reduced: "
+                    f"{current_lr:.2e} -> {next_lr:.2e}"
+                )
+
+    print(f"Saved: {curves_path.name} (overwritten)")
 
     # 訓練結束後，最後一輪不一定最好，因此重新載入最佳 checkpoint。
     model.load_state_dict(

@@ -19,6 +19,7 @@ food-11/
 # Kaggle predictions and generated previews
 predict*.csv
 augmentation_preview.jpg
+training_curves.png
 
 # Training logs and experiment outputs
 outputs/
