@@ -18,12 +18,14 @@ food-11/
 
 # Kaggle predictions and generated previews
 predict*.csv
+pseudo_label_analysis.csv
 augmentation_preview.jpg
 training_curves.png
 
 # Training logs and experiment outputs
 outputs/
 runs/
+reference_history.csv
 
 # Editors and operating systems
 .vscode/

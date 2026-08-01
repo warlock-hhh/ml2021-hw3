@@ -22,7 +22,7 @@ import torch.nn as nn
 # Pillow：讀取 JPG 圖片，也用來輸出訓練曲線（不需額外安裝 matplotlib）。
 from PIL import Image, ImageDraw
 # DataLoader：把 Dataset 分批、打亂並交給模型。
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 # transforms：圖片 Resize、轉 Tensor 與後續的 data augmentation。
 from torchvision import transforms
 # DatasetFolder：根據子資料夾名稱自動建立 class label。
@@ -40,6 +40,8 @@ except ModuleNotFoundError:
 ROOT = Path(__file__).resolve().parent
 # 資料集預期放在「程式所在資料夾 / food-11」。
 DATA_ROOT = ROOT / "food-11"
+# Pseudo-label 分析統一使用這幾個候選信心門檻。
+PSEUDO_THRESHOLDS = (0.50, 0.60, 0.70, 0.80, 0.90, 0.95)
 
 
 def load_rgb_image(path: str) -> Image.Image:
@@ -50,63 +52,193 @@ def load_rgb_image(path: str) -> Image.Image:
         return image.convert("RGB")
 
 
+class PseudoLabelDataset(Dataset):
+    """保存 Teacher 選出的圖片路徑與 pseudo label。"""
+
+    def __init__(
+        self,
+        samples: list[tuple[str, int]],
+        transform,
+    ) -> None:
+        self.samples = samples
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
+        image_path, pseudo_label = self.samples[index]
+        image = load_rgb_image(image_path)
+        # Pseudo-labeled 圖片訓練時使用與 labeled data 相同的 augmentation。
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, pseudo_label
+
+
+class ResidualBlock(nn.Module):
+    """兩層卷積加上一條 shortcut；必要時用 1×1 Conv 對齊形狀。"""
+
+    def __init__(
+        self,
+        input_channels: int,
+        output_channels: int,
+        stride: int = 1,
+    ) -> None:
+        super().__init__()
+
+        self.residual_layers = nn.Sequential(
+            nn.Conv2d(
+                input_channels,
+                output_channels,
+                kernel_size=3,
+                stride=stride,
+                padding=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(output_channels),
+            nn.ReLU(),
+            nn.Conv2d(
+                output_channels,
+                output_channels,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(output_channels),
+        )
+
+        # Channel 數或圖片大小改變時，x 無法直接與 residual 相加，
+        # 因此用 1×1 Conv 將 shortcut 轉成相同形狀。
+        if stride != 1 or input_channels != output_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(
+                    input_channels,
+                    output_channels,
+                    kernel_size=1,
+                    stride=stride,
+                    bias=False,
+                ),
+                nn.BatchNorm2d(output_channels),
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+        self.relu = nn.ReLU()
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """F(x) + x；shortcut 讓 Gradient 能更直接往前傳。"""
+        residual = self.residual_layers(features)
+        shortcut = self.shortcut(features)
+        return self.relu(residual + shortcut)
+
+
 class Classifier(nn.Module):
     """輸入 [batch, 3, 128, 128]，輸出 [batch, 11] logits。"""
 
-    def __init__(self, dropout_rate: float = 0.0) -> None:
+    def __init__(
+        self,
+        dropout_rate: float = 0.0,
+        architecture: str = "baseline",
+    ) -> None:
         # 初始化 nn.Module，讓 PyTorch 能追蹤所有可訓練參數。
         super().__init__()
 
-        # CNN 負責從圖片抽取空間特徵。
-        self.cnn_layers = nn.Sequential(
-            # [B, 3, 128, 128] -> [B, 64, 128, 128]
-            # padding=1 讓 3×3 convolution 前後的長寬維持不變。
-            nn.Conv2d(3, 64, 3, padding=1),
-            # 穩定每個 channel 的數值分布。
-            nn.BatchNorm2d(64),
-            # 加入非線性：負數歸零，正數保留。
-            nn.ReLU(),
-            # 2×2 pooling：長寬各縮小一半。
-            # [B, 64, 128, 128] -> [B, 64, 64, 64]
-            nn.MaxPool2d(2),
-
-            # [B, 64, 64, 64] -> [B, 128, 64, 64]
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            # [B, 128, 64, 64] -> [B, 128, 32, 32]
-            nn.MaxPool2d(2),
-
-            # [B, 128, 32, 32] -> [B, 256, 32, 32]
-            nn.Conv2d(128, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            # 4×4 pooling：長寬各除以 4。
-            # [B, 256, 32, 32] -> [B, 256, 8, 8]
-            nn.MaxPool2d(4),
-        )
-
-        # Fully connected layers 根據 CNN 特徵決定最終類別。
-        self.fc_layers = nn.Sequential(
-            # 256×8×8 = 16,384 個特徵，壓縮成 256 維。
-            nn.Linear(256 * 8 * 8, 256),
-            nn.ReLU(),
-            # 訓練時隨機將部分特徵歸零；驗證與推論時自動關閉。
-            nn.Dropout(dropout_rate),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            # Food-11 有 11 類，因此輸出 11 個 logits。
-            # 不加 Softmax，因為 CrossEntropyLoss 會在內部處理。
-            nn.Linear(256, 11),
-        )
+        if architecture == "baseline":
+            # 原始架構完整保留，確保先前 checkpoint 仍可載入。
+            self.cnn_layers = nn.Sequential(
+                nn.Conv2d(3, 64, 3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(),
+                nn.MaxPool2d(2),
+                nn.Conv2d(64, 128, 3, padding=1),
+                nn.BatchNorm2d(128),
+                nn.ReLU(),
+                nn.MaxPool2d(2),
+                nn.Conv2d(128, 256, 3, padding=1),
+                nn.BatchNorm2d(256),
+                nn.ReLU(),
+                nn.MaxPool2d(4),
+            )
+            self.fc_layers = nn.Sequential(
+                # 256×8×8 = 16,384；此層約有 419 萬個參數。
+                nn.Linear(256 * 8 * 8, 256),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(256, 256),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(256, 11),
+            )
+        elif architecture == "gap":
+            # 增加一層 convolution，再以 Global Average Pooling
+            # 取代巨大的 Flatten + Fully Connected 輸入。
+            self.cnn_layers = nn.Sequential(
+                # [B, 3, 128, 128] -> [B, 64, 64, 64]
+                nn.Conv2d(3, 64, 3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(),
+                nn.MaxPool2d(2),
+                # -> [B, 128, 32, 32]
+                nn.Conv2d(64, 128, 3, padding=1),
+                nn.BatchNorm2d(128),
+                nn.ReLU(),
+                nn.MaxPool2d(2),
+                # -> [B, 256, 16, 16]
+                nn.Conv2d(128, 256, 3, padding=1),
+                nn.BatchNorm2d(256),
+                nn.ReLU(),
+                nn.MaxPool2d(2),
+                # -> [B, 512, 8, 8]
+                nn.Conv2d(256, 512, 3, padding=1),
+                nn.BatchNorm2d(512),
+                nn.ReLU(),
+                nn.MaxPool2d(2),
+                # [B, 512, 8, 8] -> [B, 512, 1, 1]
+                nn.AdaptiveAvgPool2d((1, 1)),
+            )
+            self.fc_layers = nn.Sequential(
+                # FC 輸入從原本 16,384 降到 512。
+                nn.Linear(512, 256),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(256, 11),
+            )
+        elif architecture == "residual":
+            # 小型 Residual CNN：比 GAP 更深，但以較窄的 channel
+            # 控制參數量；最後同樣使用 Global Average Pooling。
+            self.cnn_layers = nn.Sequential(
+                # Stem：[B, 3, 128, 128] -> [B, 32, 64, 64]
+                nn.Conv2d(3, 32, 3, padding=1, bias=False),
+                nn.BatchNorm2d(32),
+                nn.ReLU(),
+                nn.MaxPool2d(2),
+                # 不改變形狀，學習 32-channel 的 residual。
+                ResidualBlock(32, 32),
+                # stride=2 同時增加 channel 並縮小長寬。
+                # -> [B, 64, 32, 32]
+                ResidualBlock(32, 64, stride=2),
+                # -> [B, 128, 16, 16]
+                ResidualBlock(64, 128, stride=2),
+                # -> [B, 256, 8, 8]
+                ResidualBlock(128, 256, stride=2),
+                # -> [B, 256, 1, 1]
+                nn.AdaptiveAvgPool2d((1, 1)),
+            )
+            self.fc_layers = nn.Sequential(
+                nn.Linear(256, 256),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(256, 11),
+            )
+        else:
+            raise ValueError(f"不支援的 architecture：{architecture}")
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """定義資料通過模型的順序（forward pass）。"""
         # images：[B, 3, 128, 128]
-        # features：[B, 256, 8, 8]
+        # features 形狀依架構不同；最後都可用 flatten(1) 轉成 FC 輸入。
         features = self.cnn_layers(images)
-        # flatten(1) 保留 batch 維度，把其餘維度攤平成 [B, 16384]。
+        # flatten(1) 保留 batch 維度，把其餘維度攤平成一維。
         # FC layers 最後回傳 [B, 11]。
         return self.fc_layers(features.flatten(1))
 
@@ -224,12 +356,45 @@ def build_loaders(
     return train_loader, valid_loader, test_loader
 
 
+def build_unlabeled_loader(
+    batch_size: int,
+    num_workers: int,
+) -> tuple[DatasetFolder, DataLoader]:
+    """建立 pseudo-label 分析用的 unlabeled Dataset 與 DataLoader。"""
+
+    # Teacher 判斷信心時不可使用隨機 augmentation，
+    # 否則同一張圖片每次分析會得到不同的裁切與預測結果。
+    eval_transform = transforms.Compose(
+        [
+            transforms.Resize((128, 128)),
+            transforms.ToTensor(),
+        ]
+    )
+    unlabeled_set = DatasetFolder(
+        DATA_ROOT / "training" / "unlabeled",
+        loader=load_rgb_image,
+        extensions=("jpg",),
+        transform=eval_transform,
+    )
+    unlabeled_loader = DataLoader(
+        unlabeled_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+    return unlabeled_set, unlabeled_loader
+
+
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
+    cutmix: bool = False,
+    cutmix_alpha: float = 1.0,
+    cutmix_probability: float = 0.5,
 ) -> tuple[float, float]:
     """
     完整走過一份 DataLoader。
@@ -247,7 +412,7 @@ def run_epoch(
 
     # 累計整個 epoch 的 loss、答對數量與樣本總數。
     total_loss = 0.0
-    total_correct = 0
+    total_correct = 0.0
     total_samples = 0
 
     description = "Train" if training else "Valid"
@@ -266,10 +431,53 @@ def run_epoch(
         # training=True：PyTorch 建立計算圖，以便 backward。
         # training=False：不追蹤 gradient，節省驗證所需記憶體與時間。
         with torch.set_grad_enabled(training):
+            # CutMix 只在訓練時隨機啟用：把同一個 batch 的兩張圖片
+            # 各取一部分組合成新圖片，標籤也按實際拼接面積加權。
+            use_cutmix = (
+                training
+                and cutmix
+                and images.size(0) > 1
+                and torch.rand(1).item() < cutmix_probability
+            )
+            if use_cutmix:
+                permutation = torch.randperm(images.size(0), device=device)
+                labels_b = labels[permutation]
+                # Beta(alpha, alpha) 決定原圖保留比例；alpha=1 為均勻抽樣。
+                sampled_lambda = torch.distributions.Beta(
+                    cutmix_alpha,
+                    cutmix_alpha,
+                ).sample().item()
+                image_height, image_width = images.shape[-2:]
+                cut_ratio = (1.0 - sampled_lambda) ** 0.5
+                cut_width = int(image_width * cut_ratio)
+                cut_height = int(image_height * cut_ratio)
+                center_x = torch.randint(0, image_width, (1,)).item()
+                center_y = torch.randint(0, image_height, (1,)).item()
+                x1 = max(center_x - cut_width // 2, 0)
+                x2 = min(center_x + cut_width // 2, image_width)
+                y1 = max(center_y - cut_height // 2, 0)
+                y2 = min(center_y + cut_height // 2, image_height)
+
+                images[:, :, y1:y2, x1:x2] = images[
+                    permutation, :, y1:y2, x1:x2
+                ]
+                # 邊界截斷後，必須用真正貼入的面積重新計算 lambda。
+                mixed_area = (x2 - x1) * (y2 - y1)
+                mix_lambda = 1.0 - mixed_area / (
+                    image_width * image_height
+                )
+
             # Forward pass：[B, 3, 128, 128] -> [B, 11] logits。
             logits = model(images)
-            # 比較 logits 與正確 labels，得到此 batch 的平均 loss。
-            loss = criterion(logits, labels)
+            if use_cutmix:
+                # 一張混合圖片同時對應兩個類別，loss 依面積比例加權。
+                loss = (
+                    mix_lambda * criterion(logits, labels)
+                    + (1.0 - mix_lambda) * criterion(logits, labels_b)
+                )
+            else:
+                # 一般訓練或 validation 使用原始單一標籤。
+                loss = criterion(logits, labels)
 
             if training:
                 # Backpropagation：計算 loss 對每個參數的 gradient。
@@ -283,13 +491,187 @@ def run_epoch(
         batch_count = labels.size(0)
         # loss.item() 是 batch 平均 loss；乘樣本數後才能正確做全體平均。
         total_loss += loss.item() * batch_count
-        # argmax 找出 11 個 logits 中最大者，作為預測類別。
-        total_correct += (logits.argmax(dim=1) == labels).sum().item()
+        # CutMix 的 accuracy 也依兩個標籤的圖片面積加權。
+        predictions = logits.argmax(dim=1)
+        if use_cutmix:
+            total_correct += (
+                mix_lambda * (predictions == labels).sum().item()
+                + (1.0 - mix_lambda)
+                * (predictions == labels_b).sum().item()
+            )
+        else:
+            total_correct += (predictions == labels).sum().item()
         total_samples += batch_count
 
     # 平均 loss = loss 總和 / 圖片數。
     # accuracy = 答對圖片數 / 圖片總數。
     return total_loss / total_samples, total_correct / total_samples
+
+
+def analyze_pseudo_labels(
+    model: nn.Module,
+    dataset: DatasetFolder,
+    loader: DataLoader,
+    device: torch.device,
+    output_path: Path,
+) -> None:
+    """分析 Teacher 對 unlabeled data 的信心並覆寫分析 CSV。"""
+
+    model.eval()
+    all_confidences: list[float] = []
+    all_predictions: list[int] = []
+
+    with torch.no_grad():
+        for images, _ in tqdm(loader, desc="Analyze unlabeled"):
+            logits = model(images.to(device, non_blocking=True))
+            # Softmax 將 11 個 logits 轉成總和為 1 的類別機率。
+            probabilities = torch.softmax(logits, dim=1)
+            # 每張圖片取最高機率及其類別，作為信心與 pseudo label。
+            confidences, predictions = probabilities.max(dim=1)
+            all_confidences.extend(confidences.cpu().tolist())
+            all_predictions.extend(predictions.cpu().tolist())
+
+    if len(all_confidences) != len(dataset.samples):
+        raise RuntimeError("Pseudo-label 數量與 unlabeled 圖片數量不一致")
+
+    # 固定檔名，每次分析都覆蓋；保留逐張結果供後續篩選使用。
+    with output_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(["Path", "PseudoLabel", "Confidence"])
+        for (image_path, _), prediction, confidence in zip(
+            dataset.samples,
+            all_predictions,
+            all_confidences,
+        ):
+            relative_path = Path(image_path).relative_to(DATA_ROOT)
+            writer.writerow(
+                [relative_path.as_posix(), prediction, f"{confidence:.8f}"]
+            )
+
+    confidences_tensor = torch.tensor(all_confidences)
+    predictions_tensor = torch.tensor(all_predictions)
+    print(f"Unlabeled images: {len(dataset)}")
+    print(
+        "Confidence: "
+        f"mean={confidences_tensor.mean().item():.4f}, "
+        f"median={confidences_tensor.median().item():.4f}, "
+        f"max={confidences_tensor.max().item():.4f}"
+    )
+
+    # 同時觀察選取總數和各類分布，避免 pseudo labels 嚴重偏向少數類別。
+    print("\nPseudo-label distribution")
+    print("threshold | total | " + " ".join(f"c{i:02d}" for i in range(11)))
+    print("-" * 87)
+    for threshold in PSEUDO_THRESHOLDS:
+        selected = confidences_tensor >= threshold
+        class_counts = torch.bincount(
+            predictions_tensor[selected],
+            minlength=11,
+        )
+        counts_text = " ".join(f"{count.item():4d}" for count in class_counts)
+        print(
+            f"{threshold:9.2f} | "
+            f"{selected.sum().item():5d} | "
+            f"{counts_text}"
+        )
+
+    print(f"\nSaved: {output_path.name} (overwritten)")
+
+
+def analyze_validation_confidence(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> None:
+    """用有答案的 validation data 檢查 Softmax 信心是否可靠。"""
+
+    model.eval()
+    all_confidences: list[float] = []
+    all_predictions: list[int] = []
+    all_labels: list[int] = []
+
+    with torch.no_grad():
+        for images, labels in tqdm(loader, desc="Calibrate validation"):
+            logits = model(images.to(device, non_blocking=True))
+            probabilities = torch.softmax(logits, dim=1)
+            confidences, predictions = probabilities.max(dim=1)
+            all_confidences.extend(confidences.cpu().tolist())
+            all_predictions.extend(predictions.cpu().tolist())
+            all_labels.extend(labels.tolist())
+
+    confidences_tensor = torch.tensor(all_confidences)
+    predictions_tensor = torch.tensor(all_predictions)
+    labels_tensor = torch.tensor(all_labels)
+    correct = predictions_tensor == labels_tensor
+
+    print("\nValidation confidence calibration")
+    print("threshold | selected | correct | actual accuracy")
+    print("-" * 52)
+    for threshold in PSEUDO_THRESHOLDS:
+        selected = confidences_tensor >= threshold
+        selected_count = selected.sum().item()
+        correct_count = (correct & selected).sum().item()
+        accuracy = (
+            correct_count / selected_count
+            if selected_count > 0
+            else 0.0
+        )
+        print(
+            f"{threshold:9.2f} | "
+            f"{selected_count:8d} | "
+            f"{correct_count:7d} | "
+            f"{accuracy:15.2%}"
+        )
+
+
+def create_pseudo_label_dataset(
+    model: nn.Module,
+    unlabeled_set: DatasetFolder,
+    unlabeled_loader: DataLoader,
+    train_transform,
+    device: torch.device,
+    threshold: float,
+) -> PseudoLabelDataset:
+    """由 Teacher 選出信心達門檻的圖片，建立 pseudo-labeled Dataset。"""
+
+    model.eval()
+    selected_samples: list[tuple[str, int]] = []
+    class_counts = [0] * 11
+    sample_offset = 0
+
+    with torch.no_grad():
+        for images, _ in tqdm(unlabeled_loader, desc="Create pseudo labels"):
+            logits = model(images.to(device, non_blocking=True))
+            probabilities = torch.softmax(logits, dim=1)
+            confidences, predictions = probabilities.max(dim=1)
+
+            # DataLoader 使用 shuffle=False，因此 batch 順序與 samples 完全一致。
+            for batch_index in range(images.size(0)):
+                if confidences[batch_index].item() >= threshold:
+                    dataset_index = sample_offset + batch_index
+                    image_path = unlabeled_set.samples[dataset_index][0]
+                    pseudo_label = predictions[batch_index].item()
+                    selected_samples.append((image_path, pseudo_label))
+                    class_counts[pseudo_label] += 1
+            sample_offset += images.size(0)
+
+    if not selected_samples:
+        raise RuntimeError(
+            f"threshold={threshold:.2f} 沒有選到任何 pseudo label"
+        )
+
+    print(
+        f"Pseudo labels: {len(selected_samples)}/{len(unlabeled_set)} "
+        f"(threshold={threshold:.2f})"
+    )
+    print(
+        "Pseudo classes: "
+        + " ".join(
+            f"c{class_index:02d}={count}"
+            for class_index, count in enumerate(class_counts)
+        )
+    )
+    return PseudoLabelDataset(selected_samples, train_transform)
 
 
 def save_training_curves(
@@ -375,9 +757,12 @@ def save_training_curves(
             draw.line(valid_points, fill=(255, 127, 14), width=3)
 
         # 以紅色直線標出 validation accuracy 最佳的 epoch。
+        # Pseudo fine-tuning 的 Teacher baseline 記為 epoch 0；
+        # 圖上將它畫在最左側，避免超出繪圖範圍。
+        plotted_best_epoch = max(best_epoch, 1)
         best_x = plot_left + (
             (plot_right - plot_left)
-            * (best_epoch - 1)
+            * (plotted_best_epoch - 1)
             / max(epoch_count - 1, 1)
         )
         draw.line(
@@ -387,7 +772,7 @@ def save_training_curves(
         )
 
         # X 軸顯示第一輪、最佳輪與目前最後一輪。
-        for epoch_number in sorted({1, best_epoch, epoch_count}):
+        for epoch_number in sorted({1, plotted_best_epoch, epoch_count}):
             x = plot_left + (
                 (plot_right - plot_left)
                 * (epoch_number - 1)
@@ -453,6 +838,157 @@ def write_predictions(
         writer.writerows(enumerate(predictions))
 
 
+def evaluate_and_write_ensemble(
+    gap_model: nn.Module,
+    residual_model: nn.Module,
+    cutmix_model: nn.Module,
+    valid_loader: DataLoader,
+    test_loader: DataLoader,
+    device: torch.device,
+    output_path: Path,
+) -> None:
+    """比較三模型權重，選出最佳 validation 組合並輸出 Kaggle CSV。"""
+
+    gap_model.eval()
+    residual_model.eval()
+    cutmix_model.eval()
+
+    # 只測少量事先決定的比例，避免在 660 張 validation 上過度調參。
+    # 權重順序固定為：GAP pseudo、Residual pseudo、Residual CutMix。
+    candidate_weights = (
+        (0.50, 0.50, 0.00),
+        (0.40, 0.40, 0.20),
+        (0.30, 0.40, 0.30),
+        (0.40, 0.30, 0.30),
+        (0.30, 0.30, 0.40),
+        (0.25, 0.25, 0.50),
+        (0.20, 0.20, 0.60),
+    )
+    # 每個 batch 保存三個模型對原圖及水平翻轉圖的機率。
+    valid_probability_batches: list[tuple[torch.Tensor, ...]] = []
+    valid_label_batches: list[torch.Tensor] = []
+
+    with torch.no_grad():
+        for images, labels in tqdm(valid_loader, desc="Ensemble valid"):
+            images = images.to(device, non_blocking=True)
+            flipped_images = torch.flip(images, dims=(3,))
+            valid_probability_batches.append(
+                (
+                    torch.softmax(gap_model(images), dim=1).cpu(),
+                    torch.softmax(residual_model(images), dim=1).cpu(),
+                    torch.softmax(cutmix_model(images), dim=1).cpu(),
+                    torch.softmax(gap_model(flipped_images), dim=1).cpu(),
+                    torch.softmax(
+                        residual_model(flipped_images), dim=1
+                    ).cpu(),
+                    torch.softmax(
+                        cutmix_model(flipped_images), dim=1
+                    ).cpu(),
+                )
+            )
+            valid_label_batches.append(labels.cpu())
+
+    valid_labels = torch.cat(valid_label_batches)
+    validation_results: list[
+        tuple[float, float, tuple[float, ...], bool]
+    ] = []
+    print("\nValidation ensemble + TTA comparison")
+    print(" TTA | GAP | Residual | CutMix | loss   | accuracy")
+    print("-" * 58)
+    for use_tta in (False, True):
+        for weights in candidate_weights:
+            probability_batches = []
+            for probabilities in valid_probability_batches:
+                gap_prob, residual_prob, cutmix_prob = probabilities[:3]
+                if use_tta:
+                    flipped_gap, flipped_residual, flipped_cutmix = (
+                        probabilities[3:]
+                    )
+                    gap_prob = (gap_prob + flipped_gap) / 2
+                    residual_prob = (
+                        residual_prob + flipped_residual
+                    ) / 2
+                    cutmix_prob = (cutmix_prob + flipped_cutmix) / 2
+                probability_batches.append(
+                    weights[0] * gap_prob
+                    + weights[1] * residual_prob
+                    + weights[2] * cutmix_prob
+                )
+            ensemble_probabilities = torch.cat(probability_batches)
+            predictions = ensemble_probabilities.argmax(dim=1)
+            accuracy = (
+                (predictions == valid_labels).float().mean().item()
+            )
+            correct_probabilities = ensemble_probabilities.gather(
+                1,
+                valid_labels.unsqueeze(1),
+            ).squeeze(1)
+            loss = -torch.log(
+                correct_probabilities.clamp_min(1e-12)
+            ).mean().item()
+            validation_results.append((accuracy, loss, weights, use_tta))
+            print(
+                f"{'on ' if use_tta else 'off'} | "
+                f"{weights[0]:3.2f} | {weights[1]:8.2f} | "
+                f"{weights[2]:6.2f} | {loss:.4f} | {accuracy:.4f}"
+            )
+
+    # accuracy 優先；若同分，再選 cross-entropy loss 較低者。
+    best_accuracy, best_loss, best_weights, best_tta = max(
+        validation_results,
+        key=lambda result: (result[0], -result[1]),
+    )
+    print(
+        f"Selected TTA={'on' if best_tta else 'off'} | "
+        f"GAP={best_weights[0]:.2f}, "
+        f"Residual={best_weights[1]:.2f}, "
+        f"CutMix={best_weights[2]:.2f} | "
+        f"loss={best_loss:.4f}, acc={best_accuracy:.4f}"
+    )
+
+    test_predictions: list[int] = []
+    with torch.no_grad():
+        for images, _ in tqdm(test_loader, desc="Ensemble test"):
+            images = images.to(device, non_blocking=True)
+            gap_probabilities = torch.softmax(gap_model(images), dim=1)
+            residual_probabilities = torch.softmax(
+                residual_model(images),
+                dim=1,
+            )
+            cutmix_probabilities = torch.softmax(
+                cutmix_model(images),
+                dim=1,
+            )
+            if best_tta:
+                flipped_images = torch.flip(images, dims=(3,))
+                gap_probabilities = (
+                    gap_probabilities
+                    + torch.softmax(gap_model(flipped_images), dim=1)
+                ) / 2
+                residual_probabilities = (
+                    residual_probabilities
+                    + torch.softmax(residual_model(flipped_images), dim=1)
+                ) / 2
+                cutmix_probabilities = (
+                    cutmix_probabilities
+                    + torch.softmax(cutmix_model(flipped_images), dim=1)
+                ) / 2
+            ensemble_probabilities = (
+                best_weights[0] * gap_probabilities
+                + best_weights[1] * residual_probabilities
+                + best_weights[2] * cutmix_probabilities
+            )
+            test_predictions.extend(
+                ensemble_probabilities.argmax(dim=1).cpu().tolist()
+            )
+
+    with output_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(["Id", "Category"])
+        writer.writerows(enumerate(test_predictions))
+    print(f"Saved: {output_path.name}")
+
+
 def parse_args() -> argparse.Namespace:
     """讀取使用者從終端機傳入的執行參數。"""
 
@@ -476,11 +1012,72 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="FC hidden layers 的 Dropout 比例，例如 0.3",
     )
+    # baseline 保留舊模型；gap 使用更深卷積與 Global Average Pooling。
+    parser.add_argument(
+        "--architecture",
+        choices=("baseline", "gap", "residual"),
+        default="baseline",
+        help="模型架構：baseline、gap 或 residual（預設：baseline）",
+    )
     # 根據 validation loss 自動降低 learning rate。
     parser.add_argument(
         "--scheduler",
         action="store_true",
         help="validation loss 停滯時自動降低 learning rate",
+    )
+    # 額外競賽技巧：在 batch 內剪貼兩張圖片並混合其標籤。
+    parser.add_argument(
+        "--cutmix",
+        action="store_true",
+        help="訓練時使用 CutMix（不修改硬碟上的原始圖片）",
+    )
+    parser.add_argument(
+        "--cutmix-alpha",
+        type=float,
+        default=1.0,
+        help="CutMix Beta 分布參數（預設：1.0）",
+    )
+    parser.add_argument(
+        "--cutmix-probability",
+        type=float,
+        default=0.5,
+        help="每個 training batch 使用 CutMix 的機率（預設：0.5）",
+    )
+    # Adam 的 L2 regularization 強度；預設保留目前最佳實驗的 1e-5。
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=1e-5,
+        help="Adam 的 weight decay，例如 1e-4（預設：1e-5）",
+    )
+    # 只分析 unlabeled data，不進行訓練或 testing prediction。
+    parser.add_argument(
+        "--analyze-pseudo",
+        action="store_true",
+        help="載入指定實驗的最佳模型，分析 unlabeled pseudo-label 信心",
+    )
+    parser.add_argument(
+        "--teacher-checkpoint",
+        type=str,
+        default=None,
+        help="分析時指定 Teacher checkpoint；相對路徑以程式資料夾為基準",
+    )
+    parser.add_argument(
+        "--ensemble",
+        action="store_true",
+        help="比較 GAP、Residual 與 CutMix 三模型的加權機率",
+    )
+    # 使用現有最佳模型建立 pseudo labels，再以合併資料繼續訓練。
+    parser.add_argument(
+        "--pseudo-label",
+        action="store_true",
+        help="載入 Teacher，加入高信心 unlabeled data 進行 fine-tuning",
+    )
+    parser.add_argument(
+        "--pseudo-threshold",
+        type=float,
+        default=0.95,
+        help="Pseudo label 最低 Softmax 信心（預設：0.95）",
     )
     # 指定此參數時不訓練，只載入 best_model.pt 重新產生 CSV。
     parser.add_argument(
@@ -501,6 +1098,25 @@ def main() -> None:
         raise FileNotFoundError(f"找不到資料集：{DATA_ROOT}")
     if not 0.0 <= args.dropout < 1.0:
         raise ValueError("--dropout 必須介於 0.0（含）與 1.0（不含）之間")
+    if args.weight_decay < 0.0:
+        raise ValueError("--weight-decay 不可小於 0")
+    if args.cutmix_alpha <= 0.0:
+        raise ValueError("--cutmix-alpha 必須大於 0")
+    if not 0.0 <= args.cutmix_probability <= 1.0:
+        raise ValueError("--cutmix-probability 必須介於 0 與 1 之間")
+    if not 0.0 < args.pseudo_threshold <= 1.0:
+        raise ValueError("--pseudo-threshold 必須介於 0 與 1 之間")
+    if args.analyze_pseudo and args.pseudo_label:
+        raise ValueError("--analyze-pseudo 與 --pseudo-label 不可同時使用")
+    if args.teacher_checkpoint is not None and not args.analyze_pseudo:
+        raise ValueError("--teacher-checkpoint 目前只能搭配 --analyze-pseudo")
+    if args.ensemble and (
+        args.analyze_pseudo or args.pseudo_label or args.predict_only
+    ):
+        raise ValueError(
+            "--ensemble 不可與 --analyze-pseudo、"
+            "--pseudo-label 或 --predict-only 同時使用"
+        )
 
     # 若 CUDA 可用就使用 GPU，否則退回 CPU。
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -514,15 +1130,115 @@ def main() -> None:
         num_workers=args.num_workers,
         augment=args.augment,
     )
+
+    if args.ensemble:
+        gap_checkpoint_path = (
+            ROOT
+            / "best_model_gap_aug_dropout01_scheduler_pseudo090.pt"
+        )
+        residual_checkpoint_path = (
+            ROOT
+            / "best_model_residual_aug_dropout01_scheduler_pseudo095.pt"
+        )
+        cutmix_checkpoint_path = (
+            ROOT
+            / "best_model_residual_aug_dropout01_scheduler_cutmix.pt"
+        )
+        for ensemble_checkpoint in (
+            gap_checkpoint_path,
+            residual_checkpoint_path,
+            cutmix_checkpoint_path,
+        ):
+            if not ensemble_checkpoint.is_file():
+                raise FileNotFoundError(
+                    f"找不到 Ensemble 模型：{ensemble_checkpoint}"
+                )
+
+        gap_model = Classifier(
+            dropout_rate=0.1,
+            architecture="gap",
+        ).to(device)
+        residual_model = Classifier(
+            dropout_rate=0.1,
+            architecture="residual",
+        ).to(device)
+        cutmix_model = Classifier(
+            dropout_rate=0.1,
+            architecture="residual",
+        ).to(device)
+        gap_model.load_state_dict(
+            torch.load(
+                gap_checkpoint_path,
+                map_location=device,
+                weights_only=True,
+            )
+        )
+        residual_model.load_state_dict(
+            torch.load(
+                residual_checkpoint_path,
+                map_location=device,
+                weights_only=True,
+            )
+        )
+        cutmix_model.load_state_dict(
+            torch.load(
+                cutmix_checkpoint_path,
+                map_location=device,
+                weights_only=True,
+            )
+        )
+
+        ensemble_output_path = (
+            ROOT / "predict_ensemble_gap_residual_cutmix_tta.csv"
+        )
+        print("Ensemble: GAP pseudo + Residual pseudo + Residual CutMix")
+        print(f"GAP model: {gap_checkpoint_path.name}")
+        print(f"Residual model: {residual_checkpoint_path.name}")
+        print(f"CutMix model: {cutmix_checkpoint_path.name}")
+        print(
+            f"Images: valid={len(valid_loader.dataset)}, "
+            f"test={len(test_loader.dataset)}"
+        )
+        evaluate_and_write_ensemble(
+            gap_model,
+            residual_model,
+            cutmix_model,
+            valid_loader,
+            test_loader,
+            device,
+            ensemble_output_path,
+        )
+        return
+
     print(f"Augmentation: {'on' if args.augment else 'off'}")
     print(f"Dropout: {args.dropout}")
+    print(f"Weight decay: {args.weight_decay:.2e}")
+    print(f"Architecture: {args.architecture}")
+    print(
+        "CutMix: "
+        + (
+            f"on (alpha={args.cutmix_alpha}, "
+            f"probability={args.cutmix_probability})"
+            if args.cutmix
+            else "off"
+        )
+    )
     print(
         f"Images: train={len(train_loader.dataset)}, "
         f"valid={len(valid_loader.dataset)}, test={len(test_loader.dataset)}"
     )
 
     # 建立模型並將全部參數搬到 CUDA 或 CPU。
-    model = Classifier(dropout_rate=args.dropout).to(device)
+    model = Classifier(
+        dropout_rate=args.dropout,
+        architecture=args.architecture,
+    ).to(device)
+    trainable_parameters = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    print(f"Trainable parameters: {trainable_parameters:,}")
     # 多類別單選分類使用 CrossEntropyLoss。
     criterion = nn.CrossEntropyLoss()
     # Adam 負責根據 gradient 更新所有可訓練參數。
@@ -531,7 +1247,7 @@ def main() -> None:
         # learning rate：每次更新參數的步伐大小。
         lr=3e-4,
         # L2 regularization，稍微抑制權重變得過大。
-        weight_decay=1e-5,
+        weight_decay=args.weight_decay,
     )
     # ReduceLROnPlateau 觀察 validation loss：
     # 連續 3 個 epoch 沒有改善後，將 learning rate 乘以 0.5。
@@ -552,6 +1268,8 @@ def main() -> None:
     # 只保存 state_dict（模型學到的參數），不保存 Python 類別本身。
     # 根據實驗設定使用不同檔名，方便公平比較且避免互相覆寫。
     experiment_parts: list[str] = []
+    if args.architecture != "baseline":
+        experiment_parts.append(args.architecture)
     if args.augment:
         experiment_parts.append("aug")
     if args.dropout > 0:
@@ -560,12 +1278,76 @@ def main() -> None:
         experiment_parts.append(f"dropout{dropout_tag}")
     if args.scheduler:
         experiment_parts.append("scheduler")
+    if args.cutmix:
+        experiment_parts.append("cutmix")
+    if args.weight_decay != 1e-5:
+        # 1e-4 -> wd1em4；只有非預設值才加標籤，以相容舊實驗檔名。
+        weight_decay_tag = (
+            f"{args.weight_decay:.0e}"
+            .replace("e-0", "em")
+            .replace("e-", "em")
+            .replace("e+0", "e")
+            .replace("e+", "e")
+        )
+        experiment_parts.append(f"wd{weight_decay_tag}")
+    # 尚未加入 pseudo 標籤的實驗名稱，就是要載入的 Teacher。
+    teacher_experiment_tag = "_".join(experiment_parts)
+    teacher_suffix = (
+        f"_{teacher_experiment_tag}" if teacher_experiment_tag else ""
+    )
+    teacher_checkpoint_path = ROOT / f"best_model{teacher_suffix}.pt"
+    if args.teacher_checkpoint is not None:
+        requested_teacher_path = Path(args.teacher_checkpoint)
+        teacher_checkpoint_path = (
+            requested_teacher_path
+            if requested_teacher_path.is_absolute()
+            else ROOT / requested_teacher_path
+        )
+
+    if args.pseudo_label:
+        # 0.95 -> pseudo095，避免小數點出現在檔名中。
+        pseudo_threshold_tag = (
+            f"{args.pseudo_threshold:.2f}".replace(".", "")
+        )
+        experiment_parts.append(f"pseudo{pseudo_threshold_tag}")
     experiment_tag = "_".join(experiment_parts)
     suffix = f"_{experiment_tag}" if experiment_tag else ""
     checkpoint_path = ROOT / f"best_model{suffix}.pt"
     prediction_path = ROOT / f"predict{suffix}.csv"
     # 不依實驗名稱改檔名：每次執行都覆蓋舊圖，避免累積大量圖片。
     curves_path = ROOT / "training_curves.png"
+    # Pseudo-label 分析也使用固定檔名，每次執行直接覆蓋。
+    pseudo_analysis_path = ROOT / "pseudo_label_analysis.csv"
+
+    # analyze-pseudo：使用現有最佳模型掃描 unlabeled data，不重新訓練。
+    if args.analyze_pseudo:
+        if not teacher_checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"找不到 Teacher 模型：{teacher_checkpoint_path}"
+            )
+        model.load_state_dict(
+            torch.load(
+                teacher_checkpoint_path,
+                map_location=device,
+                weights_only=True,
+            )
+        )
+        unlabeled_set, unlabeled_loader = build_unlabeled_loader(
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
+        print(f"Teacher: {teacher_checkpoint_path.name}")
+        # Validation 有正確答案，先確認高 Softmax 信心是否真的較準。
+        analyze_validation_confidence(model, valid_loader, device)
+        # 再將相同 threshold 套用到沒有答案的 unlabeled data。
+        analyze_pseudo_labels(
+            model,
+            unlabeled_set,
+            unlabeled_loader,
+            device,
+            pseudo_analysis_path,
+        )
+        return
 
     # predict-only：跳過訓練，直接從既有最佳模型產生提交檔。
     if args.predict_only:
@@ -580,9 +1362,73 @@ def main() -> None:
         print(f"Saved: {prediction_path.name}")
         return
 
-    # accuracy 不可能低於 0，因此 -1 可保證第一輪一定會保存。
-    best_accuracy = -1.0
-    best_epoch = 0
+    if args.pseudo_label:
+        if not teacher_checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"找不到 Teacher 模型：{teacher_checkpoint_path}"
+            )
+        # 從目前最佳 Teacher 繼續學，而不是重新隨機初始化。
+        model.load_state_dict(
+            torch.load(
+                teacher_checkpoint_path,
+                map_location=device,
+                weights_only=True,
+            )
+        )
+        print(f"Teacher: {teacher_checkpoint_path.name}")
+
+        unlabeled_set, unlabeled_loader = build_unlabeled_loader(
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
+        # labeled 與 pseudo-labeled 圖片使用完全相同的 training transform。
+        labeled_set = train_loader.dataset
+        pseudo_set = create_pseudo_label_dataset(
+            model,
+            unlabeled_set,
+            unlabeled_loader,
+            labeled_set.transform,
+            device,
+            args.pseudo_threshold,
+        )
+        combined_set = ConcatDataset([labeled_set, pseudo_set])
+        train_loader = DataLoader(
+            combined_set,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+        print(
+            f"Combined training images: "
+            f"{len(labeled_set)} labeled + {len(pseudo_set)} pseudo "
+            f"= {len(combined_set)}"
+        )
+
+        # Fine-tuning 使用比 Teacher 初始訓練更小的 learning rate。
+        for parameter_group in optimizer.param_groups:
+            parameter_group["lr"] = 1e-4
+        print("Pseudo fine-tuning LR: 1.00e-04")
+
+        # Epoch 0 先記錄 Teacher 表現；若 fine-tuning 沒改善，仍保留 Teacher。
+        teacher_valid_loss, teacher_valid_accuracy = run_epoch(
+            model,
+            valid_loader,
+            criterion,
+            device,
+        )
+        best_accuracy = teacher_valid_accuracy
+        best_epoch = 0
+        torch.save(model.state_dict(), checkpoint_path)
+        print(
+            f"Teacher baseline | valid loss={teacher_valid_loss:.4f}, "
+            f"acc={teacher_valid_accuracy:.4f}"
+        )
+        print(f"Saved: {checkpoint_path.name}")
+    else:
+        # accuracy 不可能低於 0，因此 -1 可保證第一輪一定會保存。
+        best_accuracy = -1.0
+        best_epoch = 0
 
     # 保存每個 epoch 的四項指標，提供畫圖使用。
     train_losses: list[float] = []
@@ -596,7 +1442,14 @@ def main() -> None:
         current_lr = optimizer.param_groups[0]["lr"]
         # 傳入 optimizer -> training mode，會更新模型。
         train_loss, train_accuracy = run_epoch(
-            model, train_loader, criterion, device, optimizer
+            model,
+            train_loader,
+            criterion,
+            device,
+            optimizer,
+            cutmix=args.cutmix,
+            cutmix_alpha=args.cutmix_alpha,
+            cutmix_probability=args.cutmix_probability,
         )
         # 不傳 optimizer -> validation mode，不更新模型。
         valid_loss, valid_accuracy = run_epoch(

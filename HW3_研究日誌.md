@@ -21,8 +21,12 @@
 | Augmentation + Dropout 0.3 | 40 | 53.03% | 47.818% | 47.311% |
 | Augmentation + Dropout 0.1 | 40 | 55.76% | 52.779% | 51.911% |
 | Augmentation + Dropout 0.1 + Scheduler | 40 | **56.21%** | **56.066%** | **55.794%** |
+| GAP + Pseudo label | 20 | 64.09% | 64.196% | 64.277% |
+| Residual + Pseudo label | 20 | 66.06% | 65.391% | 64.695% |
+| GAP + Residual + CutMix Ensemble | - | 68.94% | 68.798% | 68.100% |
+| 五層 CNN + Dynamic pseudo-label | 500 | **76.36%** | **76.748%** | **77.897%** |
 
-## 目前最佳設定
+## 早期最佳設定
 
 ```text
 Data augmentation：開啟
@@ -71,8 +75,89 @@ Scheduler 實際降低 learning rate 的過程：
 - 曲線圖使用固定檔名覆蓋，避免累積大量圖片。
 - 曲線圖同時顯示 train/valid loss、accuracy 與最佳 epoch。
 
-## 下一步
+## 中期探索與反省
 
-保持目前最佳設定，只將 `weight_decay` 從 `1e-5` 調整為 `1e-4`，
-測試較強的權重正則化能否縮小 train/validation 差距。一次只改一個
-變因，避免無法判斷改善來源。
+早期改善集中在 Dropout、scheduler 與 weight decay，但提升逐漸有限。
+後續加入 GAP、Residual connection、CutMix、pseudo-label、Ensemble 與
+TTA，最高 Public accuracy 約為 68.7%。這些實驗有助於理解不同技巧，
+但也一度變成為了分數疊加方法，難以判斷真正的主要改善來源。
+
+因此最後重新參考高分 notebook，將競賽版本獨立成
+`hw03_reference.py`，不再繼續堆疊 Ensemble，而是完整重現一套一致的
+訓練流程。
+
+## 最終方法：Dynamic self-labeling
+
+### 模型
+
+- 五層 CNN，channel 依序為 64、128、256、512、1024。
+- 每層使用 Conv2d、BatchNorm、ReLU 與 MaxPool。
+- Fully connected layers 使用 Dropout 0.6 與 0.4。
+- 約 43 MB 的最佳模型權重。
+
+### 資料增強
+
+- RandomResizedCrop 128×128。
+- AutoAugment（default、CIFAR10、SVHN policy 隨機選擇）。
+- HorizontalFlip、ColorJitter、RandomAffine。
+- 增強在讀取 batch 時即時產生，不修改硬碟上的原始圖片。
+
+### Optimization
+
+```text
+Optimizer：Adam
+Learning rate：3e-4
+Weight decay：1e-5
+Loss：CrossEntropyLoss
+Gradient clipping：max norm 10
+Batch size：32
+Epoch：500
+```
+
+### Dynamic pseudo-label 流程
+
+1. 先只使用 3,080 張 labeled images 訓練。
+2. Best validation accuracy 超過 70% 後，啟動 self-labeling。
+3. Teacher 對 6,786 張 unlabeled images 產生 Softmax confidence。
+4. 只選擇 confidence ≥ 0.90 的預測作為 pseudo labels。
+5. 將 pseudo-labeled images 暫時與 labeled dataset 合併訓練。
+6. 每 5 epochs 重新推論與更新 pseudo labels。
+
+Pseudo-label 在 epoch 190 首次啟動，當時加入 1,783 張圖片；訓練結束
+前已選入約 4,287 張。這些標籤不會寫回原始 dataset，而是訓練期間在
+記憶體中動態建立。
+
+## 最終結果
+
+```text
+完整訓練：500 epochs
+最佳 epoch：443
+最佳 validation accuracy：76.36%
+最佳 validation loss：0.8066
+Kaggle Private accuracy：76.748%
+Kaggle Public accuracy：77.897%
+```
+
+Validation、Private 與 Public accuracy 接近，表示 validation split 能
+合理反映模型泛化能力。Public 成績相較最初 baseline 的 48.387% 提升
+約 29.51 個百分點，也超過原先設定的 70% 目標。
+
+## 結論與學習重點
+
+1. 高準確率不是由單一超參數造成，而是模型容量、資料增強、資料量與
+   optimization 共同作用。
+2. 少量 labeled data 很容易 overfit；強 augmentation 能提供不同輸入
+   變化，但不會憑空產生新的語意資訊。
+3. Pseudo-label 的關鍵不是把所有未標記資料加入，而是先建立可靠的
+   teacher，再以 confidence threshold 控制標籤雜訊。
+4. Dynamic self-labeling 會隨 teacher 進步更新標籤，比只產生一次
+   pseudo labels 更完整。
+5. Train accuracy 可能低於 validation accuracy，因為 training data
+   使用強增強、Dropout，且包含可能有雜訊的 pseudo labels。
+6. Ensemble、TTA 與 CutMix 並非必然提升；方法是否有效仍應由公平的
+   validation 實驗驗證。
+7. 這次 500 epochs 約訓練 8 小時，主要成本來自大型 CNN、即時強增強、
+   pseudo-label 後增加的資料量，以及每 5 epochs 掃描全部 unlabeled data。
+
+本作業到此結案；後續複習以能解釋 model、augmentation、training loop
+與 dynamic pseudo-label 四個核心為主，不再繼續以堆疊技巧刷分。
