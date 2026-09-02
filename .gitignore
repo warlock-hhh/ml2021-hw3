@@ -21,6 +21,7 @@ predict*.csv
 pseudo_label_analysis.csv
 augmentation_preview.jpg
 training_curves.png
+*.pdf
 
 # Training logs and experiment outputs
 outputs/
