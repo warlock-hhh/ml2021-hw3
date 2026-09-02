@@ -33,3 +33,12 @@ reference_history.csv
 .idea/
 .DS_Store
 Thumbs.db
+# Secrets and local credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+kaggle.json
+credentials*.json
+secrets*/
